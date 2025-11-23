@@ -3,7 +3,8 @@
 Plugin Name: WP Assign Author to User
 Description: Group comments by email and assign them to WordPress users (create users if needed).
 Version: 1.2
-Author: Your Name
+Author: RadialMonster
+Plugin URI: https://github.com/radialmonster/wp-assign-author-to-user
 Text Domain: wp-assign-author-to-user
 */
 
@@ -12,7 +13,7 @@ if (!defined('ABSPATH')) {
 }
 
 add_action('admin_menu', function () {
-    add_management_page(
+    add_comments_page(
         'Assign Author to User',
         'Assign Author to User',
         'manage_options',
@@ -25,7 +26,7 @@ add_action('admin_menu', function () {
  * Enqueue admin scripts and add inline JS for the plugin page.
  */
 function waatu_enqueue_admin_scripts($hook) {
-    if ($hook !== 'tools_page_wp-assign-author-to-user') {
+    if ($hook !== 'comments_page_wp-assign-author-to-user') {
         return;
     }
 
@@ -186,7 +187,7 @@ function waatu_handle_actions() {
     if (isset($_GET['filter'])) $redirect_args['filter'] = sanitize_text_field($_GET['filter']);
 
     // Perform Redirect
-    wp_redirect(add_query_arg($redirect_args, admin_url('tools.php')));
+    wp_redirect(add_query_arg($redirect_args, admin_url('edit-comments.php')));
     exit;
 }
 // Hook the logic function to admin_init
@@ -226,57 +227,70 @@ function waatu_render_admin_page()
     if (!in_array($order, $valid_order)) $order = 'desc';
     if (!in_array($filter, $valid_filter)) $filter = 'all';
 
-    // Build filter subquery if needed
-    $filter_clause = '';
+    // Build queries based on filter
+    $join_clause = "";
+    $having_clause = "";
+
     if ($filter === 'unlinked') {
-        // Only show emails where either: no user exists OR some comments are unlinked
-        // We'll filter this after getting results since it requires checking user existence
+        // Filter logic:
+        // 1. Email has NO associated user (u.ID IS NULL)
+        // 2. OR Email HAS user, but some comments are not linked to that user (c.user_id != u.ID OR c.user_id = 0)
+        // Note: We join users on email. If c.user_id points to a different user (or 0), it's unlinked/mismatched.
+        
+        $join_clause = "LEFT JOIN {$wpdb->users} u ON c.comment_author_email = u.user_email";
+        $having_clause = "HAVING existing_user_id IS NULL OR SUM(CASE WHEN c.user_id != existing_user_id OR c.user_id = 0 THEN 1 ELSE 0 END) > 0";
     }
 
-    $total_emails_sql = "SELECT COUNT(DISTINCT comment_author_email) FROM {$wpdb->comments} WHERE comment_author_email <> '' AND comment_approved NOT IN ('spam','trash')";
-    $total_emails = (int) $wpdb->get_var($total_emails_sql);
+    // 1. Get Total Count (Filtered)
+    // For complex HAVING clauses, a subquery is safest for counting groups
+    $count_sql = "
+        SELECT COUNT(*) FROM (
+            SELECT c.comment_author_email, MAX(u.ID) as existing_user_id
+            FROM {$wpdb->comments} c
+            {$join_clause}
+            WHERE c.comment_author_email != '' AND c.comment_approved NOT IN ('spam','trash')
+            GROUP BY c.comment_author_email
+            {$having_clause}
+        ) as temp_table
+    ";
+    $total_emails = (int) $wpdb->get_var($count_sql);
 
-    $select_clause = "comment_author_email AS email, COUNT(*) AS comment_count, GROUP_CONCAT(DISTINCT comment_author ORDER BY comment_author SEPARATOR ' | ') AS names";
+
+    // 2. Get Paginated Results
+    $select_clause = "
+        c.comment_author_email AS email, 
+        COUNT(*) AS comment_count, 
+        GROUP_CONCAT(DISTINCT c.comment_author ORDER BY c.comment_author SEPARATOR ' | ') AS names,
+        MAX(u.ID) as existing_user_id
+    ";
+    
+    // Ensure we join for the main query if we need it for selection or filtering
+    if (empty($join_clause)) {
+        $join_clause = "LEFT JOIN {$wpdb->users} u ON c.comment_author_email = u.user_email";
+    }
+
     $order_clause = "comment_count " . strtoupper($order);
-    if ($orderby === 'email') $order_clause = "comment_author_email " . strtoupper($order);
+    if ($orderby === 'email') $order_clause = "c.comment_author_email " . strtoupper($order);
     if ($orderby === 'name') {
-        $select_clause .= ", MIN(comment_author) AS first_name";
+        $select_clause .= ", MIN(c.comment_author) AS first_name";
         $order_clause = "first_name " . strtoupper($order);
     }
 
     $limit = absint($per_page);
     $offset_val = absint($offset);
 
-    $sql = "SELECT {$select_clause} FROM {$wpdb->comments} WHERE comment_author_email != '' AND comment_approved NOT IN ('spam','trash') GROUP BY comment_author_email ORDER BY {$order_clause} LIMIT {$limit} OFFSET {$offset_val}";
-    $all_groups = $wpdb->get_results($sql);
-
-    // Apply filter if needed
-    $groups = [];
-    if ($filter === 'unlinked') {
-        foreach ($all_groups as $row) {
-            $user = get_user_by('email', $row->email);
-            if (!$user) {
-                // No user exists - include this
-                $groups[] = $row;
-            } else {
-                // Check if there are unlinked or orphaned comments
-                $unlinked_count = (int) $wpdb->get_var($wpdb->prepare(
-                    "SELECT COUNT(*) FROM {$wpdb->comments} c
-                    LEFT JOIN {$wpdb->users} u ON c.user_id = u.ID
-                    WHERE c.comment_author_email = %s
-                    AND (c.user_id = 0 OR c.user_id != %d OR u.ID IS NULL)
-                    AND c.comment_approved NOT IN ('spam','trash')",
-                    $row->email, $user->ID
-                ));
-                if ($unlinked_count > 0) {
-                    // Has unlinked or orphaned comments - include this
-                    $groups[] = $row;
-                }
-            }
-        }
-    } else {
-        $groups = $all_groups;
-    }
+    $sql = "
+        SELECT {$select_clause} 
+        FROM {$wpdb->comments} c
+        {$join_clause}
+        WHERE c.comment_author_email != '' AND c.comment_approved NOT IN ('spam','trash') 
+        GROUP BY c.comment_author_email 
+        {$having_clause}
+        ORDER BY {$order_clause} 
+        LIMIT {$limit} OFFSET {$offset_val}
+    ";
+    
+    $groups = $wpdb->get_results($sql);
 
     $total_pages = max(1, ceil($total_emails / $per_page));
 
@@ -284,7 +298,7 @@ function waatu_render_admin_page()
     function waatu_sortable_column_header($key, $label, $current_orderby, $current_order, $current_page, $current_filter) {
         $new_order = ($current_orderby === $key && $current_order === 'asc') ? 'desc' : 'asc';
         $arrow = $current_orderby === $key ? ($current_order === 'asc' ? ' ▲' : ' ▼') : '';
-        $url = add_query_arg(['page' => 'wp-assign-author-to-user', 'orderby' => $key, 'order' => $new_order, 'paged' => $current_page, 'filter' => $current_filter], admin_url('tools.php'));
+        $url = add_query_arg(['page' => 'wp-assign-author-to-user', 'orderby' => $key, 'order' => $new_order, 'paged' => $current_page, 'filter' => $current_filter], admin_url('edit-comments.php'));
         return sprintf('<a href="%s" style="text-decoration: none; color: inherit; font-weight: bold;">%s%s</a>', esc_url($url), esc_html($label), $arrow);
     }
 
@@ -300,11 +314,11 @@ function waatu_render_admin_page()
             <span style="display: inline-block; margin-right: 10px;">
                 <strong>Filter:</strong>
             </span>
-            <a href="<?php echo esc_url(add_query_arg(['page' => 'wp-assign-author-to-user', 'filter' => 'all', 'orderby' => $orderby, 'order' => $order], admin_url('tools.php'))); ?>"
+            <a href="<?php echo esc_url(add_query_arg(['page' => 'wp-assign-author-to-user', 'filter' => 'all', 'orderby' => $orderby, 'order' => $order], admin_url('edit-comments.php'))); ?>"
                class="button <?php echo $filter === 'all' ? 'button-primary' : ''; ?>">
                 Show All
             </a>
-            <a href="<?php echo esc_url(add_query_arg(['page' => 'wp-assign-author-to-user', 'filter' => 'unlinked', 'orderby' => $orderby, 'order' => $order], admin_url('tools.php'))); ?>"
+            <a href="<?php echo esc_url(add_query_arg(['page' => 'wp-assign-author-to-user', 'filter' => 'unlinked', 'orderby' => $orderby, 'order' => $order], admin_url('edit-comments.php'))); ?>"
                class="button <?php echo $filter === 'unlinked' ? 'button-primary' : ''; ?>">
                 Show Unlinked Only
             </a>
@@ -366,21 +380,21 @@ function waatu_render_admin_page()
                 $email = $row->email;
                 $names = $row->names;
                 $count = (int) $row->comment_count;
-                $user  = get_user_by('email', $email);
+                
+                // We can use the ID from the query if available, but get_user_by is cached and safe for getting the full object
+                $user = get_user_by('email', $email); 
                 $row_id = 'comments-' . md5($email);
+                
+                // Calculate unlinked count for the "Action" column logic
                 $unlinked_count = 0;
                 if ($user) {
-                    // Count unlinked or orphaned comments
-                    $unlinked_count = (int) $wpdb->get_var($wpdb->prepare(
-                        "SELECT COUNT(*) FROM {$wpdb->comments} c
-                        LEFT JOIN {$wpdb->users} u ON c.user_id = u.ID
-                        WHERE c.comment_author_email = %s
-                        AND (c.user_id = 0 OR c.user_id != %d OR u.ID IS NULL)
-                        AND c.comment_approved NOT IN ('spam','trash')",
+                     // We can query this efficiently or rely on the fact that if we are in 'unlinked' view, we know there are some.
+                     // But for the "Link" button text, we need the exact count of *unlinked* items.
+                     $unlinked_count = (int) $wpdb->get_var($wpdb->prepare(
+                        "SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_author_email = %s AND (user_id = 0 OR user_id != %d) AND comment_approved NOT IN ('spam','trash')",
                         $email, $user->ID
                     ));
                 } else {
-                    // No user exists, count all comments with this email
                     $unlinked_count = (int) $count;
                 }
             ?>

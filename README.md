@@ -20,13 +20,13 @@ When visitors leave comments on your WordPress site without being logged in, tho
 1. Download the plugin
 2. Upload to `/wp-content/plugins/wp-assign-author-to-user/`
 3. Activate through the 'Plugins' menu in WordPress
-4. Navigate to Users → Assign Comments in the WordPress admin
+4. Navigate to Comments → Assign Author to User in the WordPress admin
 
 ## Usage
 
 ### Link Comments to Existing User
 
-1. Go to **Users → Assign Comments**
+1. Go to **Comments → Assign Author to User**
 2. Find the email address you want to link
 3. Click **Link to existing user**
 4. Select the user from the dropdown
@@ -34,7 +34,7 @@ When visitors leave comments on your WordPress site without being logged in, tho
 
 ### Create New User and Link Comments
 
-1. Go to **Users → Assign Comments**
+1. Go to **Comments → Assign Author to User**
 2. Find the email address you want to link
 3. Click **Create new user**
 4. Fill in the username and name
